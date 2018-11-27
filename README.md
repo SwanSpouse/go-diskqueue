@@ -5,3 +5,13 @@
 A Go package providing a filesystem-backed FIFO queue
 
 Pulled out of https://github.com/nsqio/nsq
+
+本项目是注释版的 go-diskqueue
+
+还有一篇博客写在: https://swanspouse.github.io/2018/11/27/nsq-disk-queue/
+
+里面难免会有一些疏漏，欢迎指正。
+
+Mingji
+
+2018-11-27
