@@ -59,47 +59,51 @@ type diskQueue struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 
 	// run-time state (also persisted to disk)
-	readPos      int64
-	writePos     int64
-	readFileNum  int64
-	writeFileNum int64
-	depth        int64
+	readPos      int64 // 当前读取数据的位置
+	writePos     int64 // 当前写入数据的位置
+	readFileNum  int64 // 当前正在读取的文件序号
+	writeFileNum int64 // 当前正在写入的文件序号
+	depth        int64 // 未读消息条数；
 
-	sync.RWMutex
+	sync.RWMutex // 同步用；上面所有信息的修改都需要同步来进行
 
 	// instantiation time metadata
-	name            string
+	name            string // 队列名字
 	dataPath        string
-	maxBytesPerFile int64 // currently this cannot change once created
-	minMsgSize      int32
-	maxMsgSize      int32
+	maxBytesPerFile int64         // currently this cannot change once created
+	minMsgSize      int32         // 每条消息大小的最小值
+	maxMsgSize      int32         // 每条消息大小的最大值
 	syncEvery       int64         // number of writes per fsync
 	syncTimeout     time.Duration // duration of time per fsync
-	exitFlag        int32
-	needSync        bool
+	exitFlag        int32         // 退出的标志
+	needSync        bool          // 是否需要将writeBuf中的数据刷写到文件中
 
 	// keeps track of the position where we have read
 	// (but not yet sent over readChan)
-	nextReadPos     int64
-	nextReadFileNum int64
+	nextReadPos     int64 // 下次读取数据的位置
+	nextReadFileNum int64 // 下次读取的文件序号
 
-	readFile  *os.File
-	writeFile *os.File
-	reader    *bufio.Reader
-	writeBuf  bytes.Buffer
+	readFile  *os.File      // 当前读取的文件句柄
+	writeFile *os.File      // 当前写入的文件句柄
+	reader    *bufio.Reader // 读buffer
+	writeBuf  bytes.Buffer  // 写buffer
 
+	// 下面的这些channel都是阻塞channel
 	// exposed via ReadChan()
 	readChan chan []byte
 
 	// internal channels
-	writeChan         chan []byte
-	writeResponseChan chan error
-	emptyChan         chan int
-	emptyResponseChan chan error
-	exitChan          chan int
-	exitSyncChan      chan int
+	/* 这种chan, responseChan的结构，很像request、response；
+	在等chan中有请求过来，然后进行处理，处理之后把结果丢给responseChan返回；
+	*/
+	writeChan         chan []byte // 写入的channel
+	writeResponseChan chan error  // 写入返回值的channel
+	emptyChan         chan int    // 接收清空命令的chanel
+	emptyResponseChan chan error  // 清空命令返回值的channel
+	exitChan          chan int    // 接受退出命令的channel
+	exitSyncChan      chan int    // 退出命令返回值的channel
 
-	logf AppLogFunc
+	logf AppLogFunc // log util
 }
 
 // New instantiates an instance of diskQueue, retrieving metadata
@@ -108,28 +112,29 @@ func New(name string, dataPath string, maxBytesPerFile int64,
 	minMsgSize int32, maxMsgSize int32,
 	syncEvery int64, syncTimeout time.Duration, logf AppLogFunc) Interface {
 	d := diskQueue{
-		name:              name,
-		dataPath:          dataPath,
+		name:              name,     // disk queue的名称，主要用于log和文件标识
+		dataPath:          dataPath, // 路径，以后用于存放meta_data
 		maxBytesPerFile:   maxBytesPerFile,
-		minMsgSize:        minMsgSize,
-		maxMsgSize:        maxMsgSize,
-		readChan:          make(chan []byte),
+		minMsgSize:        minMsgSize,        // 最小消息长度
+		maxMsgSize:        maxMsgSize,        // 最大消息长度
+		readChan:          make(chan []byte), // 初始化各种channel；所有的channel都是阻塞式的
 		writeChan:         make(chan []byte),
 		writeResponseChan: make(chan error),
 		emptyChan:         make(chan int),
 		emptyResponseChan: make(chan error),
 		exitChan:          make(chan int),
 		exitSyncChan:      make(chan int),
-		syncEvery:         syncEvery,
-		syncTimeout:       syncTimeout,
-		logf:              logf,
+		syncEvery:         syncEvery,   // 每过多久进行一次同步
+		syncTimeout:       syncTimeout, // 同步的timeout
+		logf:              logf,        // 打印log
 	}
 	// no need to lock here, nothing else could possibly be touching this instance
+	// 如果以前存在过同名的queue；则从文件中恢复上次退出时的状态
 	err := d.retrieveMetaData()
 	if err != nil && !os.IsNotExist(err) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.name, err)
 	}
-
+	// 启动queue
 	go d.ioLoop()
 	return &d
 }
@@ -145,6 +150,7 @@ func (d *diskQueue) ReadChan() <-chan []byte {
 }
 
 // Put writes a []byte to the queue
+// put操作是同步的，需要加锁来进行
 func (d *diskQueue) Put(data []byte) error {
 	d.RLock()
 	defer d.RUnlock()
@@ -152,7 +158,7 @@ func (d *diskQueue) Put(data []byte) error {
 	if d.exitFlag == 1 {
 		return errors.New("exiting")
 	}
-
+	// 写入和写入的返回值是分开两个chan来进行的；
 	d.writeChan <- data
 	return <-d.writeResponseChan
 }
@@ -204,7 +210,7 @@ func (d *diskQueue) exit(deleted bool) error {
 func (d *diskQueue) Empty() error {
 	d.RLock()
 	defer d.RUnlock()
-
+	// 是否正在退出
 	if d.exitFlag == 1 {
 		return errors.New("exiting")
 	}
@@ -216,8 +222,9 @@ func (d *diskQueue) Empty() error {
 }
 
 func (d *diskQueue) deleteAllFiles() error {
+	// 重置；删除所有的数据文件
 	err := d.skipToNextRWFile()
-
+	// 删除当前的meta文件
 	innerErr := os.Remove(d.metaDataFileName())
 	if innerErr != nil && !os.IsNotExist(innerErr) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to remove metadata file - %s", d.name, innerErr)
@@ -272,15 +279,17 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	// 	1. 当读完上一个文件的时候，会关闭掉上一个文件的句柄。并在下面打开应该读取的新文件。
 	//	2. 当diskQueue启动的时候，会打开相应的数据文件，并查找到应该进行读的位置。
 	if d.readFile == nil {
+		// 获取当前应该打开的文件名
 		curFileName := d.fileName(d.readFileNum)
+		// 打开文件
 		d.readFile, err = os.OpenFile(curFileName, os.O_RDONLY, 0600)
 		if err != nil {
 			return nil, err
 		}
 		d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.name, curFileName)
-
-		// 找到应该读取的位置
+		// 当重新启动的时候readPos是上一次的位置
 		if d.readPos > 0 {
+			// 找到应该读取的位置
 			_, err = d.readFile.Seek(d.readPos, 0)
 			if err != nil {
 				d.readFile.Close()
@@ -288,10 +297,10 @@ func (d *diskQueue) readOne() ([]byte, error) {
 				return nil, err
 			}
 		}
-
+		// 创建一个BufferReader
 		d.reader = bufio.NewReader(d.readFile)
 	}
-	// 首先读取4个字节的消息长度
+	// 首先读取4个字节的数据，作为消息长度
 	err = binary.Read(d.reader, binary.BigEndian, &msgSize)
 	if err != nil {
 		d.readFile.Close()
@@ -326,6 +335,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	// as the first 8 bytes (at creation time) ensuring that
 	// the value can change without affecting runtime
 	// 如果下一次应该读取的数据超过了单个文件的长度，则从下一个文件中进行读取
+	// 这里暴露出一个问题；每个文件的maxBytesPerFile的大小是固定的；如果中途修改了的话不就gg了吗？
 	if d.nextReadPos > d.maxBytesPerFile {
 		if d.readFile != nil {
 			d.readFile.Close()
@@ -349,6 +359,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 	if d.writeFile == nil {
 		// 根据当前的writeFileNum来创建新的数据文件
 		curFileName := d.fileName(d.writeFileNum)
+		// 打开文件
 		d.writeFile, err = os.OpenFile(curFileName, os.O_RDWR|os.O_CREATE, 0600)
 		if err != nil {
 			return err
@@ -395,7 +406,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 	// 所以这里先加上属于数据长度的4个字节
 	totalBytes := int64(4 + dataLen)
 	d.writePos += totalBytes
-	// diskQueue中的数据长度+1
+	// diskQueue中的未读数据长度+1
 	atomic.AddInt64(&d.depth, 1)
 
 	// 如果当前 write index 超过了设定的文件的最大长度，则下次开始写新文件。
@@ -407,6 +418,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 		// 每次准备写新文件的时候都会进行sync操作。
 		err = d.sync()
 		if err != nil {
+			// 这里的错误最后一起返回
 			d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
 		}
 		// 关闭文件
@@ -428,7 +440,7 @@ func (d *diskQueue) sync() error {
 			return err
 		}
 	}
-
+	// 保存metaData
 	err := d.persistMetaData()
 	if err != nil {
 		return err
@@ -443,8 +455,9 @@ func (d *diskQueue) sync() error {
 func (d *diskQueue) retrieveMetaData() error {
 	var f *os.File
 	var err error
-
+	// 获取文件名
 	fileName := d.metaDataFileName()
+	// 打开文件
 	f, err = os.OpenFile(fileName, os.O_RDONLY, 0600)
 	if err != nil {
 		return err
@@ -452,10 +465,12 @@ func (d *diskQueue) retrieveMetaData() error {
 	defer f.Close()
 
 	var depth int64
+	// 从文件中按照特定的格式读取数据
 	_, err = fmt.Fscanf(f, "%d\n%d,%d\n%d,%d\n", &depth, &d.readFileNum, &d.readPos, &d.writeFileNum, &d.writePos)
 	if err != nil {
 		return err
 	}
+	// 将获取到的meta数据保存下来
 	atomic.StoreInt64(&d.depth, depth)
 	d.nextReadFileNum = d.readFileNum // 初试状态下 nextReadFileNum = readFileNum
 	d.nextReadPos = d.readPos         // 初始状态下 nextReadPos = readPos
@@ -468,6 +483,7 @@ func (d *diskQueue) persistMetaData() error {
 	var f *os.File
 	var err error
 
+	// 获取metaFileName
 	fileName := d.metaDataFileName()
 	tmpFileName := fmt.Sprintf("%s.%d.tmp", fileName, rand.Int())
 
@@ -476,7 +492,7 @@ func (d *diskQueue) persistMetaData() error {
 	if err != nil {
 		return err
 	}
-
+	// 把数据写入到临时文件中
 	_, err = fmt.Fprintf(f, "%d\n%d,%d\n%d,%d\n", atomic.LoadInt64(&d.depth), d.readFileNum, d.readPos, d.writeFileNum, d.writePos)
 	if err != nil {
 		f.Close()
@@ -484,7 +500,7 @@ func (d *diskQueue) persistMetaData() error {
 	}
 	f.Sync()
 	f.Close()
-
+	// 重命名， CopyOnWrite策略，防止污染原来的metaFile
 	// atomically rename
 	return os.Rename(tmpFileName, fileName)
 }
@@ -499,11 +515,12 @@ func (d *diskQueue) fileName(fileNum int64) string {
 	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.%06d.dat"), d.name, fileNum)
 }
 
+// 检查是否读取到了末尾
 func (d *diskQueue) checkTailCorruption(depth int64) {
+	// 这个表示还有未读的数据
 	if d.readFileNum < d.writeFileNum || d.readPos < d.writePos {
 		return
 	}
-
 	// we've reached the end of the diskqueue
 	// if depth isn't 0 something went wrong
 	if depth != 0 {
@@ -516,20 +533,23 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 		atomic.StoreInt64(&d.depth, 0)
 		d.needSync = true
 	}
-
+	// 在这里判断异常情况
 	if d.readFileNum != d.writeFileNum || d.readPos != d.writePos {
+		// 读取文件序号>写入文件序号
 		if d.readFileNum > d.writeFileNum {
 			d.logf(ERROR, "DISKQUEUE(%s) readFileNum > writeFileNum (%d > %d), corruption, skipping to next writeFileNum and resetting 0...", d.name, d.readFileNum, d.writeFileNum)
 		}
-
+		// 读取位置大于>写入位置
 		if d.readPos > d.writePos {
 			d.logf(ERROR, "DISKQUEUE(%s) readPos > writePos (%d > %d), corruption, skipping to next writeFileNum and resetting 0...", d.name, d.readPos, d.writePos)
 		}
+		// 重置disk-queue
 		d.skipToNextRWFile()
 		d.needSync = true
 	}
 }
 
+// 从文件中读取一条message过后，把readPos和readFileNum向后挪动
 func (d *diskQueue) moveForward() {
 	oldReadFileNum := d.readFileNum
 	d.readFileNum = d.nextReadFileNum
@@ -540,7 +560,7 @@ func (d *diskQueue) moveForward() {
 	if oldReadFileNum != d.nextReadFileNum {
 		// sync every time we start reading from a new file
 		d.needSync = true
-
+		// 老数据被消费的了之后不留一个记录了吗？在这里把老数据都清理了
 		fn := d.fileName(oldReadFileNum)
 		err := os.Remove(fn)
 		if err != nil {
@@ -551,8 +571,10 @@ func (d *diskQueue) moveForward() {
 	d.checkTailCorruption(depth)
 }
 
+// 处理读取数据的问题
 func (d *diskQueue) handleReadError() {
 	// jump to the next read file and rename the current (bad) file
+	// 如果读取的文件和当前正在写入的文件是同一个文件；则关闭当前文件，从下一个文件开始写；
 	if d.readFileNum == d.writeFileNum {
 		// if you can't properly read from the current write file it's safe to
 		// assume that something is fucked and we should skip the current file too
@@ -560,26 +582,28 @@ func (d *diskQueue) handleReadError() {
 			d.writeFile.Close()
 			d.writeFile = nil
 		}
+		// 从下一个文件开始写
 		d.writeFileNum++
 		d.writePos = 0
 	}
-
+	// 把当前正在读取的这个文件命名为.bad后缀
 	badFn := d.fileName(d.readFileNum)
 	badRenameFn := badFn + ".bad"
 
 	d.logf(WARN, "DISKQUEUE(%s) jump to next file and saving bad file as %s", d.name, badRenameFn)
-
+	// 进行重命名
 	err := os.Rename(badFn, badRenameFn)
 	if err != nil {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to rename bad diskqueue file %s to %s", d.name, badFn, badRenameFn)
 	}
-
+	// 从下一个文件开始继续读取
 	d.readFileNum++
 	d.readPos = 0
 	d.nextReadFileNum = d.readFileNum
 	d.nextReadPos = 0
 
 	// significant state change, schedule a sync on the next iteration
+	// 同步一下文件
 	d.needSync = true
 }
 
@@ -591,10 +615,11 @@ func (d *diskQueue) handleReadError() {
 // go channels
 //
 // conveniently this also means that we're asynchronously reading from the filesystem
+// 核心
 func (d *diskQueue) ioLoop() {
 	var dataRead []byte // 读取出的数据
 	var err error       // 错误
-	var count int64     // 用来记录读取、写入了多少条消息
+	var count int64     // 用来记录读取、写入了多少条消息；每一次操作这个count都会++
 	var r chan []byte   // 用来暂存d.readChan
 	// 创建一个sync操作的ticker
 	syncTicker := time.NewTicker(d.syncTimeout)
@@ -605,6 +630,7 @@ func (d *diskQueue) ioLoop() {
 		if count == d.syncEvery {
 			d.needSync = true
 		}
+		// 每写入count条消息后；才将writeFile中的内容同步到文件；
 		if d.needSync {
 			// 将d.writeFile中的文件和meta信息刷写到磁盘。
 			err = d.sync()
@@ -616,8 +642,8 @@ func (d *diskQueue) ioLoop() {
 		}
 		// 这个说明有未读的数据
 		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {
-			// 当nextReadPos != readPos的时候，说明readChan中还有未处理的消息。不用readOnce
-			// 当nextReadPos == readPos的时候，说明readChan中已经没有未处理的消息了，需要进行readOnce
+			// 当nextReadPos != readPos的时候，说明readChan中还有未处理的消息。不用readOne
+			// 当nextReadPos == readPos的时候，说明readChan中已经没有未处理的消息了，需要进行readOne
 			if d.nextReadPos == d.readPos {
 				// 从磁盘中读取一条message
 				dataRead, err = d.readOne()
@@ -627,7 +653,6 @@ func (d *diskQueue) ioLoop() {
 					continue
 				}
 			}
-			//
 			r = d.readChan
 		} else {
 			// 这里表明没有可以读取的数据
@@ -637,11 +662,12 @@ func (d *diskQueue) ioLoop() {
 		select {
 		// the Go channel spec dictates that nil channel operations (read or write)
 		// in a select are skipped, we set r to d.readChan only when there is data to read
-		// 当有数据可以进行读取的时候
+		// 当有数据可以进行读取的时候，r 不为空
 		case r <- dataRead:
 			count++
 			// moveForward sets needSync flag if a file is removed
 			// 更新readPos, readFileNum, nextReadPos, nextReadFileNum的信息
+			// 数据读取过后才更新readPos
 			d.moveForward()
 		// 接收到清空数据的请求
 		case <-d.emptyChan:
@@ -652,7 +678,7 @@ func (d *diskQueue) ioLoop() {
 			count++
 			// 将数据写入磁盘中，并将操作结果写入writeResponseChan中。
 			d.writeResponseChan <- d.writeOne(dataWrite)
-		// 计时器响应，此时需要将metaData和w.writeFile进行持久化
+		// 定时器响应，此时需要将metaData和w.writeFile进行持久化
 		case <-syncTicker.C:
 			// 如果没有读取和写入任何消息，则不作处理。
 			if count == 0 {
@@ -662,6 +688,7 @@ func (d *diskQueue) ioLoop() {
 			d.needSync = true
 		// 接受到退出命令
 		case <-d.exitChan:
+			// 在这里没有保存一下数据相关信息啥的吗？
 			goto exit
 		}
 	}
