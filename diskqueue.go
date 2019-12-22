@@ -59,7 +59,7 @@ const (
 )
 
 // old dat file (version lower than v1.1) doesn't have a header.
-// new dat file (version higher than or equal to v1.1 ) contains a header.
+// new dat file (version equal to v1.1 ) contains a header.
 // header format:
 // [x][x][x][x][x][x][x][x][x][x][x][x]
 // | (binary) ||       (int64)        |
