@@ -53,6 +53,9 @@ type Interface interface {
 	Empty() error
 }
 
+// dat file version info
+var version11 = [4]byte{'v', '1', '.', '1'}
+
 // diskQueue implements a filesystem backed FIFO queue
 type diskQueue struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
@@ -69,7 +72,8 @@ type diskQueue struct {
 	// instantiation time metadata
 	name            string
 	dataPath        string
-	maxBytesPerFile int64 // currently this cannot change once created
+	maxBytesPerFile int64
+	maxBytesCurFile int64
 	minMsgSize      int32
 	maxMsgSize      int32
 	syncEvery       int64         // number of writes per fsync
@@ -277,15 +281,38 @@ func (d *diskQueue) readOne() ([]byte, error) {
 
 		d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.name, curFileName)
 
-		if d.readPos > 0 {
-			_, err = d.readFile.Seek(d.readPos, 0)
+		// first 8 bytes contains header info;
+		var headerInfo [4]byte
+		err = binary.Read(d.readFile, binary.BigEndian, &headerInfo)
+		if err != nil {
+			d.readFile.Close()
+			d.readFile = nil
+			return nil, err
+		} else if headerInfo == version11 {
+			var maxBytesCurFile int64
+			err = binary.Read(d.readFile, binary.BigEndian, &maxBytesCurFile)
 			if err != nil {
 				d.readFile.Close()
 				d.readFile = nil
 				return nil, err
 			}
+			d.maxBytesCurFile = maxBytesCurFile
+		} else {
+			d.maxBytesCurFile = d.maxBytesPerFile
 		}
 
+		d.logf(DEBUG, "DISKQUEUE(%s): version:%s maxBytesCurFile:%d maxBytesPerFile:%d", headerInfo, d.maxBytesCurFile, d.maxBytesPerFile)
+
+		if d.readPos > 0 {
+			_, err = d.readFile.Seek(d.readPos, 0)
+		} else {
+			_, err = d.readFile.Seek(0, 0)
+		}
+		if err != nil {
+			d.readFile.Close()
+			d.readFile = nil
+			return nil, err
+		}
 		d.reader = bufio.NewReader(d.readFile)
 	}
 
@@ -319,10 +346,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	d.nextReadPos = d.readPos + totalBytes
 	d.nextReadFileNum = d.readFileNum
 
-	// TODO: each data file should embed the maxBytesPerFile
-	// as the first 8 bytes (at creation time) ensuring that
-	// the value can change without affecting runtime
-	if d.nextReadPos > d.maxBytesPerFile {
+	if d.nextReadPos > d.maxBytesCurFile {
 		if d.readFile != nil {
 			d.readFile.Close()
 			d.readFile = nil
@@ -340,6 +364,8 @@ func (d *diskQueue) readOne() ([]byte, error) {
 func (d *diskQueue) writeOne(data []byte) error {
 	var err error
 
+	d.writeBuf.Reset()
+	var totalBytes int64
 	if d.writeFile == nil {
 		curFileName := d.fileName(d.writeFileNum)
 		d.writeFile, err = os.OpenFile(curFileName, os.O_RDWR|os.O_CREATE, 0600)
@@ -356,16 +382,26 @@ func (d *diskQueue) writeOne(data []byte) error {
 				d.writeFile = nil
 				return err
 			}
+		} else {
+			// write header info
+			err = binary.Write(&d.writeBuf, binary.BigEndian, version11)
+			if err != nil {
+				return err
+			}
+			err = binary.Write(&d.writeBuf, binary.BigEndian, d.maxBytesPerFile)
+			if err != nil {
+				return err
+			}
+			totalBytes += int64(len(version11) + 8)
+			d.logf(INFO, "DISKQUEUE(%s): write version:%s and maxBytesPerFile:%s", version11, d.maxBytesPerFile)
 		}
 	}
 
 	dataLen := int32(len(data))
-
 	if dataLen < d.minMsgSize || dataLen > d.maxMsgSize {
 		return fmt.Errorf("invalid message write size (%d) maxMsgSize=%d", dataLen, d.maxMsgSize)
 	}
 
-	d.writeBuf.Reset()
 	err = binary.Write(&d.writeBuf, binary.BigEndian, dataLen)
 	if err != nil {
 		return err
@@ -384,7 +420,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 		return err
 	}
 
-	totalBytes := int64(4 + dataLen)
+	totalBytes += int64(4 + dataLen)
 	d.writePos += totalBytes
 	d.depth += 1
 
