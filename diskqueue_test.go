@@ -108,7 +108,7 @@ func TestDiskQueueRoll(t *testing.T) {
 		panic(err)
 	}
 	defer os.RemoveAll(tmpDir)
-	msg := bytes.Repeat([]byte{0}, 10)
+	msg := []byte("test")
 	ml := int64(len(msg))
 	dq := New(dqName, tmpDir, FileHeaderLength+10*(ml+4), int32(ml), 1<<10, 2500, 2*time.Second, l)
 	defer dq.Close()
@@ -124,10 +124,24 @@ func TestDiskQueueRoll(t *testing.T) {
 	Equal(t, int64(1), dq.(*diskQueue).writeFileNum)
 	Equal(t, int64(0), dq.(*diskQueue).writePos)
 
-	for i := 10; i > 0; i-- {
-		Equal(t, msg, <-dq.ReadChan())
-		Equal(t, int64(i-1), dq.Depth())
+	dq.Close()
+
+	// change maxBytesPerFile
+	dq = New(dqName, tmpDir, FileHeaderLength+5*(ml+4), int32(ml), 1<<10, 2500, 2*time.Second, l)
+	defer dq.Close()
+
+	for i := 0; i < 5; i++ {
+		err := dq.Put(msg)
+		Nil(t, err)
+		Equal(t, int64(10+i+1), dq.Depth())
 	}
+
+	Equal(t, int64(2), dq.(*diskQueue).writeFileNum)
+	Equal(t, int64(0), dq.(*diskQueue).writePos)
+}
+
+func TestDiskQueueDataFileVersion(t *testing.T) {
+
 }
 
 func assertFileNotExist(t *testing.T, fn string) {
