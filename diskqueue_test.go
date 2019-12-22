@@ -110,7 +110,7 @@ func TestDiskQueueRoll(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	msg := bytes.Repeat([]byte{0}, 10)
 	ml := int64(len(msg))
-	dq := New(dqName, tmpDir, 10*(ml+4), int32(ml), 1<<10, 2500, 2*time.Second, l)
+	dq := New(dqName, tmpDir, FileHeaderLength+10*(ml+4), int32(ml), 1<<10, 2500, 2*time.Second, l)
 	defer dq.Close()
 	NotNil(t, dq)
 	Equal(t, int64(0), dq.Depth())
@@ -145,7 +145,7 @@ func TestDiskQueueEmpty(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 	msg := bytes.Repeat([]byte{0}, 10)
-	dq := New(dqName, tmpDir, 100, 0, 1<<10, 2500, 2*time.Second, l)
+	dq := New(dqName, tmpDir, FileHeaderLength+100, 0, 1<<10, 2500, 2*time.Second, l)
 	defer dq.Close()
 	NotNil(t, dq)
 	Equal(t, int64(0), dq.Depth())
@@ -302,7 +302,7 @@ func TestDiskQueueSyncAfterRead(t *testing.T) {
 			d.readFileNum == 0 &&
 			d.writeFileNum == 0 &&
 			d.readPos == 0 &&
-			d.writePos == 1004 {
+			d.writePos == FileHeaderLength+1004 {
 			// success
 			goto next
 		}
@@ -319,8 +319,8 @@ next:
 		if d.depth == 1 &&
 			d.readFileNum == 0 &&
 			d.writeFileNum == 0 &&
-			d.readPos == 1004 &&
-			d.writePos == 2008 {
+			d.readPos == FileHeaderLength+1004 &&
+			d.writePos == FileHeaderLength+2008 {
 			// success
 			goto done
 		}

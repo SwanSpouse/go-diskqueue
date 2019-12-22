@@ -53,8 +53,21 @@ type Interface interface {
 	Empty() error
 }
 
-// dat file version info
-var version11 = [4]byte{'v', '1', '.', '1'}
+const (
+	versionLength    = 4
+	FileHeaderLength = versionLength + 8 // version + maxBytesCurFileLength
+)
+
+// old dat file (version lower than v1.1) doesn't have a header.
+// new dat file (version higher than or equal to v1.1 ) contains a header.
+// header format:
+// [x][x][x][x][x][x][x][x][x][x][x][x]
+// | (binary) ||       (int64)        |
+// |  4-byte  ||        8-byte        |
+// ------------------------------------
+//   version      max bytes cur file
+//
+var version11 = [versionLength]byte{'v', '1', '.', '1'}
 
 // diskQueue implements a filesystem backed FIFO queue
 type diskQueue struct {
@@ -271,6 +284,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 func (d *diskQueue) readOne() ([]byte, error) {
 	var err error
 	var msgSize int32
+	var totalBytes int64
 
 	if d.readFile == nil {
 		curFileName := d.fileName(d.readFileNum)
@@ -281,14 +295,13 @@ func (d *diskQueue) readOne() ([]byte, error) {
 
 		d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.name, curFileName)
 
-		// first 8 bytes contains header info;
-		var headerInfo [4]byte
-		err = binary.Read(d.readFile, binary.BigEndian, &headerInfo)
+		var version [versionLength]byte
+		err = binary.Read(d.readFile, binary.BigEndian, &version)
 		if err != nil {
 			d.readFile.Close()
 			d.readFile = nil
 			return nil, err
-		} else if headerInfo == version11 {
+		} else if version == version11 {
 			var maxBytesCurFile int64
 			err = binary.Read(d.readFile, binary.BigEndian, &maxBytesCurFile)
 			if err != nil {
@@ -297,21 +310,20 @@ func (d *diskQueue) readOne() ([]byte, error) {
 				return nil, err
 			}
 			d.maxBytesCurFile = maxBytesCurFile
+			totalBytes += FileHeaderLength
 		} else {
 			d.maxBytesCurFile = d.maxBytesPerFile
 		}
 
-		d.logf(DEBUG, "DISKQUEUE(%s): version:%s maxBytesCurFile:%d maxBytesPerFile:%d", headerInfo, d.maxBytesCurFile, d.maxBytesPerFile)
+		d.logf(INFO, "DISKQUEUE(%s): version:%s maxBytesCurFile:%d maxBytesPerFile:%d", d.name, version, d.maxBytesCurFile, d.maxBytesPerFile)
 
 		if d.readPos > 0 {
 			_, err = d.readFile.Seek(d.readPos, 0)
-		} else {
-			_, err = d.readFile.Seek(0, 0)
-		}
-		if err != nil {
-			d.readFile.Close()
-			d.readFile = nil
-			return nil, err
+			if err != nil {
+				d.readFile.Close()
+				d.readFile = nil
+				return nil, err
+			}
 		}
 		d.reader = bufio.NewReader(d.readFile)
 	}
@@ -339,7 +351,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		return nil, err
 	}
 
-	totalBytes := int64(4 + msgSize)
+	totalBytes += int64(4 + msgSize)
 
 	// we only advance next* because we have not yet sent this to consumers
 	// (where readFileNum, readPos will actually be advanced)
@@ -392,8 +404,8 @@ func (d *diskQueue) writeOne(data []byte) error {
 			if err != nil {
 				return err
 			}
-			totalBytes += int64(len(version11) + 8)
-			d.logf(INFO, "DISKQUEUE(%s): write version:%s and maxBytesPerFile:%s", version11, d.maxBytesPerFile)
+			totalBytes += FileHeaderLength
+			d.logf(INFO, "DISKQUEUE(%s): write version:%s and maxBytesPerFile:%d", d.name, version11, d.maxBytesPerFile)
 		}
 	}
 
