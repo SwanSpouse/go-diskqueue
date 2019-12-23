@@ -83,16 +83,17 @@ type diskQueue struct {
 	sync.RWMutex
 
 	// instantiation time metadata
-	name            string
-	dataPath        string
-	maxBytesPerFile int64
-	maxBytesCurFile int64
-	minMsgSize      int32
-	maxMsgSize      int32
-	syncEvery       int64         // number of writes per fsync
-	syncTimeout     time.Duration // duration of time per fsync
-	exitFlag        int32
-	needSync        bool
+	name                 string
+	dataPath             string
+	maxBytesPerFile      int64
+	maxBytesCurReadFile  int64
+	maxBytesCurWriteFile int64
+	minMsgSize           int32
+	maxMsgSize           int32
+	syncEvery            int64         // number of writes per fsync
+	syncTimeout          time.Duration // duration of time per fsync
+	exitFlag             int32
+	needSync             bool
 
 	// keeps track of the position where we have read
 	// (but not yet sent over readChan)
@@ -302,20 +303,20 @@ func (d *diskQueue) readOne() ([]byte, error) {
 			d.readFile = nil
 			return nil, err
 		} else if version == version11 {
-			var maxBytesCurFile int64
-			err = binary.Read(d.readFile, binary.BigEndian, &maxBytesCurFile)
+			var maxBytesCurReadFile int64
+			err = binary.Read(d.readFile, binary.BigEndian, &maxBytesCurReadFile)
 			if err != nil {
 				d.readFile.Close()
 				d.readFile = nil
 				return nil, err
 			}
-			d.maxBytesCurFile = maxBytesCurFile
+			d.maxBytesCurReadFile = maxBytesCurReadFile
 			totalBytes += FileHeaderLength
 		} else {
-			d.maxBytesCurFile = d.maxBytesPerFile
+			d.maxBytesCurReadFile = d.maxBytesPerFile
 		}
 
-		d.logf(INFO, "DISKQUEUE(%s): version:%s maxBytesCurFile:%d maxBytesPerFile:%d", d.name, version, d.maxBytesCurFile, d.maxBytesPerFile)
+		d.logf(INFO, "DISKQUEUE(%s): version:%s maxBytesCurReadFile:%d maxBytesPerFile:%d", d.name, version, d.maxBytesCurReadFile, d.maxBytesPerFile)
 
 		if d.readPos > 0 {
 			_, err = d.readFile.Seek(d.readPos, 0)
@@ -358,7 +359,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	d.nextReadPos = d.readPos + totalBytes
 	d.nextReadFileNum = d.readFileNum
 
-	if d.nextReadPos > d.maxBytesCurFile {
+	if d.nextReadPos > d.maxBytesCurReadFile {
 		if d.readFile != nil {
 			d.readFile.Close()
 			d.readFile = nil
@@ -388,6 +389,26 @@ func (d *diskQueue) writeOne(data []byte) error {
 		d.logf(INFO, "DISKQUEUE(%s): writeOne() opened %s", d.name, curFileName)
 
 		if d.writePos > 0 {
+			// first read header info from write file
+			var version [versionLength]byte
+			err = binary.Read(d.writeFile, binary.BigEndian, &version)
+			if err != nil {
+				d.writeFile.Close()
+				d.writeFile = nil
+				return err
+			} else if version == version11 {
+				var maxBytesCurWriteFile int64
+				err = binary.Read(d.readFile, binary.BigEndian, &maxBytesCurWriteFile)
+				if err != nil {
+					d.writeFile.Close()
+					d.writeFile = nil
+					return err
+				}
+				d.maxBytesCurWriteFile = maxBytesCurWriteFile
+			} else {
+				d.maxBytesCurWriteFile = d.maxBytesPerFile
+			}
+
 			_, err = d.writeFile.Seek(d.writePos, 0)
 			if err != nil {
 				d.writeFile.Close()
