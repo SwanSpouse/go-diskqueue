@@ -133,11 +133,14 @@ func TestDiskQueueRoll(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		err := dq.Put(msg)
 		Nil(t, err)
-		Equal(t, int64(10+i+1), dq.Depth())
 	}
 
 	Equal(t, int64(2), dq.(*diskQueue).writeFileNum)
 	Equal(t, int64(0), dq.(*diskQueue).writePos)
+
+	for i := 0; i < 15; i++ {
+		Equal(t, msg, <-dq.ReadChan())
+	}
 }
 
 func TestDiskQueueDiffDataFileVersions(t *testing.T) {
