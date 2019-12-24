@@ -425,7 +425,6 @@ func (d *diskQueue) writeOne(data []byte) error {
 			if err != nil {
 				return err
 			}
-
 			d.maxBytesCurWriteFile = d.maxBytesPerFile
 			totalBytes += FileHeaderLength
 			d.logf(INFO, "DISKQUEUE(%s): write version:%s and maxBytesPerFile:%d", d.name, version11, d.maxBytesPerFile)
