@@ -54,6 +54,8 @@ type Interface interface {
 	Empty() error
 }
 
+var lock sync.Mutex
+
 // diskQueue implements a filesystem backed FIFO queue
 type diskQueue struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
